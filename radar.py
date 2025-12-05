@@ -1,15 +1,14 @@
-from dataclasses import dataclass
-from typing import List, Dict
-import re
-import requests
 from datetime import date
+from typing import List, Dict
+from urllib.parse import urlparse
+import random
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 app = FastAPI(
     title="Radar do Caçador",
-    description="Lê uma lista de URLs do Mercado Livre, busca detalhes dos produtos e monta pacotes de posts.",
+    description="Lê uma lista de URLs do Mercado Livre e monta pacotes de posts.",
     version="1.0.0",
 )
 
@@ -17,8 +16,7 @@ app = FastAPI(
 # CONFIGURAÇÕES
 # ==========================
 
-URLS_FILE = "urls.txt"  # arquivo com 1 URL por linha
-MELI_ITEM_URL = "https://api.mercadolibre.com/items/{item_id}"
+URLS_FILE = "urls.txt"
 
 # índices de fatia por turno (3 produtos por pacote)
 FATIAS_TURNO: Dict[str, range] = {
@@ -26,15 +24,6 @@ FATIAS_TURNO: Dict[str, range] = {
     "tarde": range(3, 6),   # produtos 3,4,5
     "noite": range(6, 9),   # produtos 6,7,8
 }
-
-
-@dataclass
-class Produto:
-    nome: str
-    preco: float
-    link: str
-    vendas: int = 0  # sold_quantity
-    id_item: str = ""
 
 
 # ==========================
@@ -48,110 +37,68 @@ def carregar_urls() -> List[str]:
     try:
         with open(URLS_FILE, "r", encoding="utf-8") as f:
             linhas = [l.strip() for l in f.readlines()]
-        return [l for l in linhas if l]
+        urls = [l for l in linhas if l]
+        if not urls:
+            raise HTTPException(
+                status_code=500,
+                detail="urls.txt está vazio. Adicione algumas URLs de produtos."
+            )
+        return urls
     except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="Arquivo urls.txt não encontrado no servidor.")
-
-
-def extrair_id_item(url: str) -> str:
-    """
-    Extrai o ID mais relevante de um produto na URL.
-    Em URLs com vários MLBs, pegamos o MAIOR (que é o ID do anúncio).
-    """
-    matches = re.findall(r"(MLB\d+)", url)
-    if not matches:
-        raise ValueError(f"Não foi possível extrair ID MLB da URL: {url}")
-
-    # Pegamos o número mais longo (ID do anúncio)
-    return max(matches, key=len)
-
-
-def buscar_detalhes_produto(item_id: str) -> Produto:
-    """
-    Chama a API pública de detalhes de item do Mercado Livre e
-    retorna um objeto Produto.
-    """
-    url = MELI_ITEM_URL.format(item_id=item_id)
-    resp = requests.get(url, timeout=10)
-
-    if resp.status_code != 200:
         raise HTTPException(
-            status_code=502,
-            detail=f"Erro ao buscar item {item_id} no Mercado Livre: {resp.text}",
+            status_code=500,
+            detail="Arquivo urls.txt não encontrado no servidor."
         )
 
-    data = resp.json()
 
-    nome = data.get("title") or f"Produto {item_id}"
-    preco = float(data.get("price") or 0)
-    link = data.get("permalink") or ""
-    vendas = int(data.get("sold_quantity") or 0)
-
-    return Produto(
-        nome=nome,
-        preco=preco,
-        link=link,
-        vendas=vendas,
-        id_item=item_id,
-    )
-
-
-def formatar_preco_brl(valor: float) -> str:
+def extrair_nome_do_slug(url: str) -> str:
     """
-    Formata o preço no padrão brasileiro: R$ 1.234,56
+    A partir da URL do Mercado Livre, tenta extrair o 'slug' do produto
+    e transformá-lo em um nome legível.
+    Exemplo:
+    .../creatina-monohidratada-500g-soldiers-nutrition-100-pura.../p/MLB123
+    -> 'Creatina Monohidratada 500g Soldiers Nutrition 100 Pura'
     """
-    s = f"{valor:,.2f}"
-    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"R$ {s}"
+    caminho = urlparse(url).path  # /creatina-monohidratada.../p/MLB...
+    # pega a parte antes de /p/
+    parte_produto = caminho.split("/p/")[0]
+    # pega o último segmento depois da barra
+    slug = parte_produto.strip("/").split("/")[-1]
+    # troca hífens por espaço
+    nome_bruto = slug.replace("-", " ")
+    # capitaliza cada palavra
+    nome_formatado = " ".join(p.capitalize() for p in nome_bruto.split())
+    return nome_formatado or "Oferta especial"
 
 
-def carregar_produtos() -> List[Produto]:
+def selecionar_urls_para_turno(urls: List[str], turno: str) -> List[str]:
     """
-    Lê o urls.txt, busca detalhes de cada produto e devolve uma lista
-    ordenada dos mais vendidos para os menos vendidos.
-    """
-    urls = carregar_urls()
-
-    produtos: List[Produto] = []
-    for url in urls:
-        try:
-            item_id = extrair_id_item(url)
-            produto = buscar_detalhes_produto(item_id)
-            produtos.append(produto)
-        except Exception:
-            # Se der problema em um item, simplesmente pula
-            continue
-
-    # ordena por vendas (mais vendidos primeiro)
-    produtos.sort(key=lambda p: p.vendas, reverse=True)
-    return produtos
-
-
-def selecionar_produtos_para_turno(produtos: List[Produto], turno: str) -> List[Produto]:
-    """
-    Usa a data do dia para criar um "embaralhamento" estável
-    e fatia a lista para cada turno, sem repetir entre manhã/tarde/noite.
+    Rotaciona / embaralha a lista de URLs com base na data + turno
+    e pega 3 diferentes para cada período.
     """
     if turno not in FATIAS_TURNO:
         raise HTTPException(status_code=400, detail=f"Turno inválido: {turno}")
 
-    # embaralhamento simples baseado na data (mesmo resultado dentro do dia)
-    hoje = date.today().toordinal()
-    # rotação da lista: desloca de acordo com o dia
-    deslocamento = hoje % len(produtos) if produtos else 0
-    produtos_rotacionados = produtos[deslocamento:] + produtos[:deslocamento]
+    if not urls:
+        return []
+
+    hoje = date.today().isoformat()
+    seed = f"{hoje}-{turno}"
+    rnd = random.Random(seed)
+    urls_embaralhadas = urls[:]  # cópia
+    rnd.shuffle(urls_embaralhadas)
 
     faixa = FATIAS_TURNO[turno]
-    selecionados = []
+    selecionadas: List[str] = []
 
     for idx in faixa:
-        if idx < len(produtos_rotacionados):
-            selecionados.append(produtos_rotacionados[idx])
+        if idx < len(urls_embaralhadas):
+            selecionadas.append(urls_embaralhadas[idx])
 
-    return selecionados
+    return selecionadas
 
 
-def montar_texto_pacote(turno: str, produtos: List[Produto]) -> str:
+def montar_texto_pacote(turno: str, urls: List[str]) -> str:
     linhas: List[str] = []
 
     titulo_mapa = {
@@ -163,17 +110,16 @@ def montar_texto_pacote(turno: str, produtos: List[Produto]) -> str:
 
     linhas.append(f"⚡ {titulo} — Caçador de Ofertas\n")
 
-    if not produtos:
-        linhas.append("Hoje não encontrei produtos bons o suficiente para esse horário. 😅")
-        linhas.append("Amanhã o radar tenta de novo.\n")
+    if not urls:
+        linhas.append("Hoje não encontrei URLs cadastradas para esse horário. 😅")
+        linhas.append("Atualize o arquivo urls.txt e tente novamente.\n")
     else:
-        for p in produtos:
-            linhas.append(p.nome)
-            linhas.append("")
-            linhas.append(formatar_preco_brl(p.preco))
-            linhas.append("Cupom: —")  # se um dia tiver cupom, a gente pluga aqui
-            linhas.append(f"Link: {p.link}")
-            linhas.append("")  # linha em branco entre produtos
+        for i, url in enumerate(urls, start=1):
+            nome = extrair_nome_do_slug(url)
+            linhas.append(f"🟡 Oferta {i}")
+            linhas.append(nome)
+            linhas.append(f"🔗 {url}")
+            linhas.append("")  # linha em branco
 
     linhas.append("💬 Eu caço e você economiza.")
     linhas.append("⚠️ Preços e estoque podem mudar a qualquer momento.\n")
@@ -182,16 +128,9 @@ def montar_texto_pacote(turno: str, produtos: List[Produto]) -> str:
 
 
 def gerar_pacote(turno: str) -> str:
-    produtos = carregar_produtos()
-    if not produtos:
-        return (
-            f"⚡ Pacote — {turno} — Caçador de Ofertas\n\n"
-            "Não há produtos cadastrados em urls.txt no momento.\n"
-            "Adicione algumas URLs de produtos do Mercado Livre e tente novamente.\n"
-        )
-
-    selecionados = selecionar_produtos_para_turno(produtos, turno)
-    texto = montar_texto_pacote(turno, selecionados)
+    urls = carregar_urls()
+    selecionadas = selecionar_urls_para_turno(urls, turno)
+    texto = montar_texto_pacote(turno, selecionadas)
     return texto
 
 
@@ -209,9 +148,6 @@ def raiz():
 
 @app.get("/pacote/{turno}", response_class=PlainTextResponse)
 def obter_pacote(turno: str):
-    """
-    Exemplos: /pacote/manha  /pacote/tarde  /pacote/noite
-    """
     turno = turno.lower()
     texto = gerar_pacote(turno)
     return texto
