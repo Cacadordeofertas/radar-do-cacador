@@ -55,12 +55,15 @@ def carregar_urls() -> List[str]:
 
 def extrair_id_item(url: str) -> str:
     """
-    Tenta encontrar um padrão tipo MLB123456789 na URL.
+    Extrai o ID mais relevante de um produto na URL.
+    Em URLs com vários MLBs, pegamos o MAIOR (que é o ID do anúncio).
     """
-    match = re.search(r"(MLB\d+)", url)
-    if not match:
+    matches = re.findall(r"(MLB\d+)", url)
+    if not matches:
         raise ValueError(f"Não foi possível extrair ID MLB da URL: {url}")
-    return match.group(1)
+
+    # Pegamos o número mais longo (ID do anúncio)
+    return max(matches, key=len)
 
 
 def buscar_detalhes_produto(item_id: str) -> Produto:
