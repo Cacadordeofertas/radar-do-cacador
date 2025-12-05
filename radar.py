@@ -25,7 +25,7 @@ KEYWORDS_BY_TURNO: Dict[str, List[str]] = {
 }
 
 # Preço máximo (troque ou coloque None se não quiser limite)
-PRECO_MAXIMO = 250.0
+PRECO_MAXIMO = None  # sem limite de preço por enquanto
 
 
 @dataclass
@@ -80,6 +80,12 @@ def converter_para_produtos(brutos: List[dict]) -> List[Produto]:
 
             shipping = item.get("shipping", {}) or {}
             frete_gratis = bool(shipping.get("free_shipping", False))
+            
+            # por enquanto vamos aceitar também sem frete grátis
+            # se quiser filtrar só frete grátis de novo, é só descomentar:
+            # if not frete_gratis:
+            #     continue
+
 
             # se quiser permitir sem frete grátis, comente o bloco abaixo:
             if not frete_gratis:
