@@ -1,31 +1,31 @@
 from dataclasses import dataclass
 from typing import List, Dict
+import re
 import requests
+from datetime import date
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 app = FastAPI(
     title="Radar do Caçador",
-    description="Backend simples para buscar ofertas no Mercado Livre e formatar pacotes de posts.",
-    version="0.1.0",
+    description="Lê uma lista de URLs do Mercado Livre, busca detalhes dos produtos e monta pacotes de posts.",
+    version="1.0.0",
 )
 
 # ==========================
-# CONFIGURAÇÕES BÁSICAS
+# CONFIGURAÇÕES
 # ==========================
 
-MELI_SEARCH_URL = "https://api.mercadolibre.com/sites/MLB/search"
+URLS_FILE = "urls.txt"  # arquivo com 1 URL por linha
+MELI_ITEM_URL = "https://api.mercadolibre.com/items/{item_id}"
 
-# Palavras-chave por turno (ajuste como quiser)
-KEYWORDS_BY_TURNO: Dict[str, List[str]] = {
-    "manha": ["fone bluetooth", "headset gamer"],
-    "tarde": ["lanterna tática", "kit ferramenta"],
-    "noite": ["suporte veicular", "gadget automotivo", "carregador veicular"],
+# índices de fatia por turno (3 produtos por pacote)
+FATIAS_TURNO: Dict[str, range] = {
+    "manha": range(0, 3),   # produtos 0,1,2
+    "tarde": range(3, 6),   # produtos 3,4,5
+    "noite": range(6, 9),   # produtos 6,7,8
 }
-
-# Preço máximo (troque ou coloque None se não quiser limite)
-PRECO_MAXIMO = None  # sem limite de preço por enquanto
 
 
 @dataclass
@@ -33,89 +33,64 @@ class Produto:
     nome: str
     preco: float
     link: str
-    frete_gratis: bool
     vendas: int = 0  # sold_quantity
-    score: float = 0  # usado para ordenar
+    id_item: str = ""
 
 
 # ==========================
-# FUNÇÕES DE NEGÓCIO
+# FUNÇÕES AUXILIARES
 # ==========================
 
-def buscar_produtos_meli(termo: str, limite: int = 30) -> List[dict]:
+def carregar_urls() -> List[str]:
     """
-    Chama a API pública de busca do Mercado Livre para um termo.
+    Lê o arquivo urls.txt e retorna a lista de URLs (sem linhas vazias).
     """
-    params = {
-        "q": termo,
-        "limit": limite,
-        "sort": "sold_quantity_desc",  # tenta priorizar mais vendidos
-    }
+    try:
+        with open(URLS_FILE, "r", encoding="utf-8") as f:
+            linhas = [l.strip() for l in f.readlines()]
+        return [l for l in linhas if l]
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="Arquivo urls.txt não encontrado no servidor.")
 
-    resp = requests.get(MELI_SEARCH_URL, params=params, timeout=10)
+
+def extrair_id_item(url: str) -> str:
+    """
+    Tenta encontrar um padrão tipo MLB123456789 na URL.
+    """
+    match = re.search(r"(MLB\d+)", url)
+    if not match:
+        raise ValueError(f"Não foi possível extrair ID MLB da URL: {url}")
+    return match.group(1)
+
+
+def buscar_detalhes_produto(item_id: str) -> Produto:
+    """
+    Chama a API pública de detalhes de item do Mercado Livre e
+    retorna um objeto Produto.
+    """
+    url = MELI_ITEM_URL.format(item_id=item_id)
+    resp = requests.get(url, timeout=10)
+
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Erro ao chamar Mercado Livre: {resp.text}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erro ao buscar item {item_id} no Mercado Livre: {resp.text}",
+        )
 
     data = resp.json()
-    return data.get("results", [])
 
+    nome = data.get("title") or f"Produto {item_id}"
+    preco = float(data.get("price") or 0)
+    link = data.get("permalink") or ""
+    vendas = int(data.get("sold_quantity") or 0)
 
-def converter_para_produtos(brutos: List[dict]) -> List[Produto]:
-    produtos: List[Produto] = []
-
-    for item in brutos:
-        try:
-            nome = item.get("title") or "Produto sem título"
-            preco = float(item.get("price") or 0)
-
-            if preco <= 0:
-                continue
-
-            if PRECO_MAXIMO is not None and preco > PRECO_MAXIMO:
-                continue
-
-            link = item.get("permalink") or ""
-            if not link:
-                continue
-
-            shipping = item.get("shipping", {}) or {}
-            frete_gratis = bool(shipping.get("free_shipping", False))
-            
-            # por enquanto vamos aceitar também sem frete grátis
-            # se quiser filtrar só frete grátis de novo, é só descomentar:
-            # if not frete_gratis:
-            #     continue
-
-
-            # se quiser permitir sem frete grátis, comente o bloco abaixo:
-            if not frete_gratis:
-                continue
-
-            vendas = int(item.get("sold_quantity") or 0)
-
-            # score simples: prioriza quem mais vendeu
-            score = float(vendas)
-
-            produtos.append(
-                Produto(
-                    nome=nome,
-                    preco=preco,
-                    link=link,
-                    frete_gratis=frete_gratis,
-                    vendas=vendas,
-                    score=score,
-                )
-            )
-        except Exception:
-            # Ignora itens quebrados
-            continue
-
-    return produtos
-
-
-def selecionar_top_n(produtos: List[Produto], n: int = 3) -> List[Produto]:
-    ordenados = sorted(produtos, key=lambda p: p.score, reverse=True)
-    return ordenados[:n]
+    return Produto(
+        nome=nome,
+        preco=preco,
+        link=link,
+        vendas=vendas,
+        id_item=item_id,
+    )
 
 
 def formatar_preco_brl(valor: float) -> str:
@@ -127,8 +102,55 @@ def formatar_preco_brl(valor: float) -> str:
     return f"R$ {s}"
 
 
+def carregar_produtos() -> List[Produto]:
+    """
+    Lê o urls.txt, busca detalhes de cada produto e devolve uma lista
+    ordenada dos mais vendidos para os menos vendidos.
+    """
+    urls = carregar_urls()
+
+    produtos: List[Produto] = []
+    for url in urls:
+        try:
+            item_id = extrair_id_item(url)
+            produto = buscar_detalhes_produto(item_id)
+            produtos.append(produto)
+        except Exception:
+            # Se der problema em um item, simplesmente pula
+            continue
+
+    # ordena por vendas (mais vendidos primeiro)
+    produtos.sort(key=lambda p: p.vendas, reverse=True)
+    return produtos
+
+
+def selecionar_produtos_para_turno(produtos: List[Produto], turno: str) -> List[Produto]:
+    """
+    Usa a data do dia para criar um "embaralhamento" estável
+    e fatia a lista para cada turno, sem repetir entre manhã/tarde/noite.
+    """
+    if turno not in FATIAS_TURNO:
+        raise HTTPException(status_code=400, detail=f"Turno inválido: {turno}")
+
+    # embaralhamento simples baseado na data (mesmo resultado dentro do dia)
+    hoje = date.today().toordinal()
+    # rotação da lista: desloca de acordo com o dia
+    deslocamento = hoje % len(produtos) if produtos else 0
+    produtos_rotacionados = produtos[deslocamento:] + produtos[:deslocamento]
+
+    faixa = FATIAS_TURNO[turno]
+    selecionados = []
+
+    for idx in faixa:
+        if idx < len(produtos_rotacionados):
+            selecionados.append(produtos_rotacionados[idx])
+
+    return selecionados
+
+
 def montar_texto_pacote(turno: str, produtos: List[Produto]) -> str:
     linhas: List[str] = []
+
     titulo_mapa = {
         "manha": "Pacote das 6h",
         "tarde": "Pacote das 12h",
@@ -146,9 +168,9 @@ def montar_texto_pacote(turno: str, produtos: List[Produto]) -> str:
             linhas.append(p.nome)
             linhas.append("")
             linhas.append(formatar_preco_brl(p.preco))
-            linhas.append("Cupom: —")  # depois podemos integrar com cupons, se tiver
+            linhas.append("Cupom: —")  # se um dia tiver cupom, a gente pluga aqui
             linhas.append(f"Link: {p.link}")
-            linhas.append("")  # linha em branco entre os produtos
+            linhas.append("")  # linha em branco entre produtos
 
     linhas.append("💬 Eu caço e você economiza.")
     linhas.append("⚠️ Preços e estoque podem mudar a qualquer momento.\n")
@@ -157,24 +179,16 @@ def montar_texto_pacote(turno: str, produtos: List[Produto]) -> str:
 
 
 def gerar_pacote(turno: str) -> str:
-    turno = turno.lower()
-    if turno not in KEYWORDS_BY_TURNO:
-        raise HTTPException(status_code=400, detail=f"Turno inválido: {turno}")
+    produtos = carregar_produtos()
+    if not produtos:
+        return (
+            f"⚡ Pacote — {turno} — Caçador de Ofertas\n\n"
+            "Não há produtos cadastrados em urls.txt no momento.\n"
+            "Adicione algumas URLs de produtos do Mercado Livre e tente novamente.\n"
+        )
 
-    termos = KEYWORDS_BY_TURNO[turno]
-
-    todos_brutos: List[dict] = []
-    for termo in termos:
-        try:
-            resultados = buscar_produtos_meli(termo)
-            todos_brutos.extend(resultados)
-        except HTTPException:
-            # apenas segue para o próximo termo se uma busca falhar
-            continue
-
-    produtos = converter_para_produtos(todos_brutos)
-    top3 = selecionar_top_n(produtos, n=3)
-    texto = montar_texto_pacote(turno, top3)
+    selecionados = selecionar_produtos_para_turno(produtos, turno)
+    texto = montar_texto_pacote(turno, selecionados)
     return texto
 
 
@@ -195,5 +209,6 @@ def obter_pacote(turno: str):
     """
     Exemplos: /pacote/manha  /pacote/tarde  /pacote/noite
     """
+    turno = turno.lower()
     texto = gerar_pacote(turno)
     return texto
